@@ -5,14 +5,172 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/anssihalmeaho/funl/funl"
 	"github.com/anssihalmeaho/funl/std"
 
 	"github.com/anssihalmeaho/fuvaluez/fuvaluez"
 )
+
+// ListenerInfo ...
+type ListenerInfo struct {
+	IsInit        bool
+	Version       string
+	ColName       string
+	WaitTimeInSec int
+}
+
+func getListener(frame *funl.Frame, mapv funl.Value) (listener ListenerInfo, err error) {
+	keyvals := funl.HandleKeyvalsOP(frame, []*funl.Item{&funl.Item{Type: funl.ValueItem, Data: mapv}})
+	kvListIter := funl.NewListIterator(keyvals)
+	for {
+		nextKV := kvListIter.Next()
+		if nextKV == nil {
+			break
+		}
+		kvIter := funl.NewListIterator(*nextKV)
+		keyv := *(kvIter.Next())
+		valv := *(kvIter.Next())
+		if keyv.Kind != funl.StringValue {
+			err = fmt.Errorf("key not a string: %v", keyv)
+			return
+		}
+		switch keyStr := keyv.Data.(string); keyStr {
+		case "is-init":
+			if valv.Kind != funl.BoolValue {
+				err = fmt.Errorf("%s invalid value: %v", keyStr, keyv)
+				return
+			}
+			listener.IsInit = valv.Data.(bool)
+		case "version":
+			if valv.Kind != funl.StringValue {
+				err = fmt.Errorf("%s invalid value: %v", keyStr, keyv)
+				return
+			}
+			listener.Version = valv.Data.(string)
+		case "col":
+			if valv.Kind != funl.StringValue {
+				err = fmt.Errorf("%s invalid value: %v", keyStr, keyv)
+				return
+			}
+			listener.ColName = valv.Data.(string)
+		case "wait-time-sec":
+			if valv.Kind != funl.IntValue {
+				err = fmt.Errorf("%s invalid value: %v", keyStr, keyv)
+				return
+			}
+			listener.WaitTimeInSec = valv.Data.(int)
+		}
+	}
+	return
+}
+
+func getLongWaiter(db *Database) func(*funl.Frame, []funl.Value) funl.Value {
+	makeErrRetList := func(frame *funl.Frame, errtxt string) funl.Value {
+		rvals := []funl.Value{
+			{
+				Kind: funl.BoolValue,
+				Data: false,
+			},
+			{
+				Kind: funl.StringValue,
+				Data: errtxt,
+			},
+			{
+				Kind: funl.StringValue,
+				Data: "",
+			},
+		}
+		return funl.MakeListOfValues(frame, rvals)
+	}
+
+	rcpLongWaiterValue := func(frame *funl.Frame, arguments []funl.Value) (retVal funl.Value) {
+		if len(arguments) == 0 {
+			retVal = makeErrRetList(frame, "no arguments received")
+			return
+		}
+		listener, err := getListener(frame, arguments[0])
+		if err != nil {
+			retVal = makeErrRetList(frame, err.Error())
+			return
+		}
+
+		notifCh := make(chan UpdateInfo)
+		var prevVers string
+		var newVers string
+		var isTimeout bool
+		if !listener.IsInit {
+			prevVers = listener.Version
+		}
+		notifInfo := NotifInfo{
+			ColName:         listener.ColName,
+			Ch:              notifCh,
+			PreviousVersion: prevVers,
+		}
+		db.ListenAddCh <- notifInfo
+		select {
+		case notif := <-notifCh:
+			//fmt.Println("notif -> ", notif)
+			newVers = notif.Version
+		case <-time.After(time.Duration(listener.WaitTimeInSec) * time.Second):
+			//fmt.Println("timeout")
+			newVers = prevVers
+			isTimeout = true
+		}
+		db.ListenDelCh <- notifInfo
+
+		operands := []*funl.Item{
+			&funl.Item{
+				Type: funl.ValueItem,
+				Data: funl.Value{
+					Kind: funl.StringValue,
+					Data: "version",
+				},
+			},
+			&funl.Item{
+				Type: funl.ValueItem,
+				Data: funl.Value{
+					Kind: funl.StringValue,
+					Data: newVers,
+				},
+			},
+			&funl.Item{
+				Type: funl.ValueItem,
+				Data: funl.Value{
+					Kind: funl.StringValue,
+					Data: "was-timedout",
+				},
+			},
+			&funl.Item{
+				Type: funl.ValueItem,
+				Data: funl.Value{
+					Kind: funl.BoolValue,
+					Data: isTimeout,
+				},
+			},
+		}
+		mapv := funl.HandleMapOP(frame, operands)
+
+		rvals := []funl.Value{
+			{
+				Kind: funl.BoolValue,
+				Data: true,
+			},
+			{
+				Kind: funl.StringValue,
+				Data: "",
+			},
+			mapv,
+		}
+		retVal = funl.MakeListOfValues(frame, rvals)
+		return
+	}
+	return rcpLongWaiterValue
+}
 
 func getRPCPutValue(db *Database) func(*funl.Frame, []funl.Value) funl.Value {
 	rpcPutValue := func(frame *funl.Frame, arguments []funl.Value) (retVal funl.Value) {
@@ -69,12 +227,15 @@ func getRPCPutValue(db *Database) func(*funl.Frame, []funl.Value) funl.Value {
 			arguments[1],
 		}
 		retVal = vzPutValue(db.TopFrame, putArgs)
+
+		// notify about change too
+		db.UpdateCh <- UpdateInfo{ColName: colName}
 		return
 	}
 	return rpcPutValue
 }
 
-func getRPChandler(db *Database, vzHandler fuvaluez.FZProc) func(*funl.Frame, []funl.Value) funl.Value {
+func getRPChandler(db *Database, vzHandler fuvaluez.FZProc, doNotify func(funl.Value) bool) func(*funl.Frame, []funl.Value) funl.Value {
 	rpcHandler := func(frame *funl.Frame, arguments []funl.Value) (retVal funl.Value) {
 		if len(arguments) < 2 {
 			rvals := []funl.Value{
@@ -140,21 +301,43 @@ func getRPChandler(db *Database, vzHandler fuvaluez.FZProc) func(*funl.Frame, []
 			funcVal,
 		}
 		retVal = vzHandler(db.TopFrame, handlerArgs)
+
+		// notify about change too
+		if doNotify(retVal) {
+			// TODO: it could be checked whether anything was updated...
+			db.UpdateCh <- UpdateInfo{ColName: colName}
+		}
 		return
 	}
 	return rpcHandler
 }
 
 func getRPCTakeValues(db *Database) func(*funl.Frame, []funl.Value) funl.Value {
-	return getRPChandler(db, vzTakeValues)
+	// if no values were taken then no need to notify change
+	doNotify := func(val funl.Value) bool {
+		lit := funl.NewListIterator(val)
+		if lit == nil {
+			return false
+		}
+		return true
+	}
+	return getRPChandler(db, vzTakeValues, doNotify)
 }
 
 func getRPCUpdate(db *Database) func(*funl.Frame, []funl.Value) funl.Value {
-	return getRPChandler(db, vzUpdate)
+	// if no values updated then no need to notify change
+	doNotify := func(val funl.Value) bool {
+		return val.Kind == funl.BoolValue && val.Data.(bool)
+	}
+	return getRPChandler(db, vzUpdate, doNotify)
 }
 
 func getRPCGetValues(db *Database) func(*funl.Frame, []funl.Value) funl.Value {
-	return getRPChandler(db, vzGetValues)
+	// this doesnt change values so no change notify
+	doNotify := func(val funl.Value) bool {
+		return false
+	}
+	return getRPChandler(db, vzGetValues, doNotify)
 }
 
 var vzOpen fuvaluez.FZProc
@@ -174,13 +357,97 @@ type ColInfo struct {
 	Col  *fuvaluez.OpaqueCol
 }
 
+// UpdateInfo ...
+type UpdateInfo struct {
+	ColName string
+	Version string
+}
+
 // Database represents valuez db
 type Database struct {
-	colsLock  sync.RWMutex
-	TopFrame  *funl.Frame
-	Cols      map[string]*ColInfo
-	Db        *fuvaluez.OpaqueDB
-	Converter funl.Value
+	colsLock    sync.RWMutex
+	TopFrame    *funl.Frame
+	Cols        map[string]*ColInfo
+	Db          *fuvaluez.OpaqueDB
+	Converter   funl.Value
+	UpdateCh    chan UpdateInfo
+	ListenAddCh chan NotifInfo
+	ListenDelCh chan NotifInfo
+}
+
+// NotifInfo ...
+type NotifInfo struct {
+	ColName         string
+	Ch              chan UpdateInfo
+	PreviousVersion string // if "" then there is no previous
+}
+
+// Notifier ...
+func (db *Database) Notifier() {
+	versions := make(map[string]int)
+	var listeners = map[string]map[chan UpdateInfo]NotifInfo{}
+
+	for {
+		select {
+		case upd := <-db.UpdateCh:
+			colVers, colFound := versions[upd.ColName]
+			if colFound {
+				versions[upd.ColName] = colVers + 1
+			} else {
+				versions[upd.ColName] = 20
+			}
+			//fmt.Println("upd -> ", versions[upd.ColName])
+			targetm, found := listeners[upd.ColName]
+			if found {
+				upd.Version = strconv.Itoa(versions[upd.ColName])
+				for targetCh := range targetm {
+					select {
+					case targetCh <- upd:
+					default:
+					}
+				}
+			}
+
+		case subs := <-db.ListenAddCh:
+			//fmt.Println("add -> ", subs)
+			if subs.ColName == "" {
+				close(subs.Ch)
+			}
+
+			// lets check if version is different, if so then trigger notification
+			// rightaway
+			if subs.PreviousVersion != "" {
+				currentVersion := strconv.Itoa(versions[subs.ColName])
+				if subs.PreviousVersion != currentVersion {
+					//fmt.Println("Immediate upd: ", currentVersion)
+
+					upd := UpdateInfo{
+						ColName: subs.ColName,
+						Version: currentVersion,
+					}
+					select {
+					case subs.Ch <- upd:
+					default:
+					}
+				}
+			}
+
+			_, found := listeners[subs.ColName]
+			if !found {
+				newm := make(map[chan UpdateInfo]NotifInfo)
+				listeners[subs.ColName] = newm
+			}
+			listeners[subs.ColName][subs.Ch] = subs
+
+		case unsubs := <-db.ListenDelCh:
+			//fmt.Println("del -> ", unsubs)
+			subs, found := listeners[unsubs.ColName][unsubs.Ch]
+			if found {
+				delete(listeners[unsubs.ColName], subs.Ch)
+				close(subs.Ch)
+			}
+		}
+	}
 }
 
 // Shutdown closes db
@@ -219,6 +486,8 @@ func (db *Database) GetCollection(colName string) (*ColInfo, error) {
 		return col, nil
 	}
 
+	// there might be possibility for collision in creating col
+	// BUT situation recovers after a while, no error is caused for client
 	colArgs := []funl.Value{
 		{
 			Kind: funl.OpaqueValue,
@@ -254,7 +523,7 @@ func OpenDatabase(frame *funl.Frame, config *conf) (*Database, error) {
 	openArgs := []funl.Value{
 		{
 			Kind: funl.StringValue,
-			Data: config.getVal("filepath") + config.getVal("dbname"),
+			Data: config.getVal("VALUFILEPATH") + config.getVal("VALUDBNAME"),
 		},
 	}
 	openRetList, err := convertToSlice(vzOpen(frame, openArgs))
@@ -326,6 +595,12 @@ func OpenDatabase(frame *funl.Frame, config *conf) (*Database, error) {
 	}
 	database.Converter = funl.HandleEvalOP(database.TopFrame, []*funl.Item{converterItem})
 
+	// lets create notifier
+	database.UpdateCh = make(chan UpdateInfo, 1000)
+	database.ListenAddCh = make(chan NotifInfo)
+	database.ListenDelCh = make(chan NotifInfo)
+	go database.Notifier()
+
 	return database, nil
 }
 
@@ -335,9 +610,9 @@ type conf struct {
 
 func newConf() *conf {
 	m := make(map[string]*string)
-	m["valuport"] = flag.String("valuport", "9901", "port number")
-	m["filepath"] = flag.String("filepath", "", "path to db-file location")
-	m["dbname"] = flag.String("dbname", "valudb", "name of database")
+	m["VALUPORT"] = flag.String("VALUPORT", "9901", "port number")
+	m["VALUFILEPATH"] = flag.String("VALUFILEPATH", "", "path to db-file location")
+	m["VALUDBNAME"] = flag.String("VALUDBNAME", "valudb", "name of database")
 
 	flag.Parse()
 
@@ -393,7 +668,7 @@ func main() {
 	}
 
 	// Create server
-	server := std.NewRServer(":" + config.getVal("valuport"))
+	server := std.NewRServer(":" + config.getVal("VALUPORT"))
 
 	// Create RPC implementation
 	putValueExtProc := funl.ExtProcType{Impl: getRPCPutValue(db)}
@@ -407,6 +682,9 @@ func main() {
 
 	updateExtProc := funl.ExtProcType{Impl: getRPCUpdate(db)}
 	updateProcVal := funl.Value{Kind: funl.ExtProcValue, Data: updateExtProc}
+
+	longWaiterExtProc := funl.ExtProcType{Impl: getLongWaiter(db)}
+	longWaiterProcVal := funl.Value{Kind: funl.ExtProcValue, Data: longWaiterExtProc}
 
 	// And register it to server
 	err = server.Register("put-value", putValueProcVal)
@@ -428,6 +706,12 @@ func main() {
 	}
 
 	err = server.Register("update", updateProcVal)
+	if err != nil {
+		fmt.Println("Err -> ", err)
+		return
+	}
+
+	err = server.Register("valu-long-waiter", longWaiterProcVal)
 	if err != nil {
 		fmt.Println("Err -> ", err)
 		return
