@@ -316,7 +316,7 @@ func getRPCTakeValues(db *Database) func(*funl.Frame, []funl.Value) funl.Value {
 	// if no values were taken then no need to notify change
 	doNotify := func(val funl.Value) bool {
 		lit := funl.NewListIterator(val)
-		if lit == nil {
+		if lit.Next() == nil {
 			return false
 		}
 		return true
