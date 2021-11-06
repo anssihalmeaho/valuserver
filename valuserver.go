@@ -637,19 +637,17 @@ func main() {
 	config := newConf()
 	var err error
 
+	interpreter := funl.NewInterpreter()
+
 	// Initialize FunL standard libraries
-	if err = std.InitSTD(); err != nil {
+	if err = std.InitSTD(interpreter); err != nil {
 		panic(fmt.Errorf("Error in std-lib init (%v)", err))
 	}
-	if err = funl.InitFunSourceSTD(); err != nil {
+	if err = funl.InitFunSourceSTD(interpreter); err != nil {
 		panic(fmt.Errorf("Error in std-lib (fun source) init (%v)", err))
 	}
 
-	frame := &funl.Frame{
-		Syms:     funl.NewSymt(),
-		OtherNS:  make(map[funl.SymID]funl.ImportInfo),
-		Imported: make(map[funl.SymID]*funl.Frame),
-	}
+	frame := funl.NewTopFrameWithInterpreter(interpreter)
 	frame.SetInProcCall(true)
 
 	vzOpen = fuvaluez.GetVZOpen("open")
@@ -668,7 +666,7 @@ func main() {
 	}
 
 	// Create server
-	server := std.NewRServer(":" + config.getVal("VALUPORT"))
+	server := std.NewRServer(frame, ":"+config.getVal("VALUPORT"))
 
 	// Create RPC implementation
 	putValueExtProc := funl.ExtProcType{Impl: getRPCPutValue(db)}
